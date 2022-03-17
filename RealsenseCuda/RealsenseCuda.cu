@@ -10,10 +10,11 @@
 #include <GL/glew.h>
 #include <GLFW/glfw3.h>
 #include <opencv2/opencv.hpp>
+#include "virtual_output.h"
 
-cudaError_t addWithCuda(int* c, const int* a, const int* b, unsigned int size);
+VirtualOutput virtual_output(1280, 720, 30, libyuv::FOURCC_BGR3);
 
-__global__ void gammaKernel(char* _dst, const char* _src, const unsigned short* _depth, int _w, float scale)
+__global__ void gammaKernel(char* _dst, const char* _src, const unsigned short* _depth, const char* _background, int _w, int _h, float scale)
 {
 	int x = blockIdx.x * blockDim.x + threadIdx.x;
 	int y = blockIdx.y;
@@ -21,11 +22,10 @@ __global__ void gammaKernel(char* _dst, const char* _src, const unsigned short* 
 
 	if (x < _w)
 	{
-		if (_depth[pos / 3] * scale < 1.0) {
+		if (_depth[pos / 3] * scale < 1.0 && _src[pos] > 0) {
 			_dst[pos] = _src[pos];
-		}
-		else {
-			_dst[pos] = 0;
+		} else {
+			_dst[pos] = _background[pos];
 		}
 	}
 }
@@ -96,13 +96,30 @@ int main(int argc, char* argv[]) try
 		printf("Second: %s \n", gluErrorString(errCode2));
 	}
 
+	cv::Mat background = cv::imread(".\\background.jpg", cv::ImreadModes::IMREAD_COLOR);
+
+	const int w = 1280;
+	const int h = 720;
+
+	int nPix = w * h;
+	char* gpuImg;
+	unsigned short* gpuDepthImg;
+	char* gpuResImg;
+	char* gpuBackgroundImg;
+	cudaMalloc((void**)&gpuImg, nPix * 3 * sizeof(char));
+	cudaMalloc((void**)&gpuDepthImg, nPix * sizeof(unsigned short));
+	cudaMalloc((void**)&gpuResImg, nPix * 3 * sizeof(char));
+	cudaMalloc((void**)&gpuBackgroundImg, nPix * 3 * sizeof(char));
+
+	char* cpuImg;
+	cpuImg = (char*)malloc(nPix * 3 * sizeof(char));
+
 	std::string serial;
-	// Create a pipeline to easily configure and start the camera
 	rs2::pipeline pipe;
 	rs2::config cfg;
 	if (!serial.empty())
 		cfg.enable_device(serial);
-	cfg.enable_stream(RS2_STREAM_COLOR, -1, 1280, 720, rs2_format::RS2_FORMAT_RGB8, 0);
+	cfg.enable_stream(RS2_STREAM_COLOR, -1, 1280, 720, rs2_format::RS2_FORMAT_BGR8, 0);
 	cfg.enable_stream(RS2_STREAM_DEPTH, -1, 1280, 720, rs2_format::RS2_FORMAT_Z16, 0);
 	rs2::pipeline_profile profile = pipe.start(cfg);
 
@@ -110,15 +127,10 @@ int main(int argc, char* argv[]) try
 	rs2::depth_sensor ds = dev.query_sensors().front().as<rs2::depth_sensor>();
 	float scale = ds.get_depth_scale();
 
-	// Define two align objects. One will be used to align
-	// to depth viewport and the other to color.
-	// Creating align object is an expensive operation
-	// that should not be performed in the main loop
 	rs2::align align_to_depth(RS2_STREAM_DEPTH);
 	rs2::align align_to_color(RS2_STREAM_COLOR);
 
-	float       alpha = 0.5f;               // Transparancy coefficient
-	direction   dir = direction::to_depth;  // Alignment direction
+	direction dir = direction::to_depth;
 
 	while (glfwGetKey(window, GLFW_KEY_ESCAPE) != GLFW_PRESS && glfwWindowShouldClose(window) == 0) // Application still alive?
 	{
@@ -133,61 +145,55 @@ int main(int argc, char* argv[]) try
 		auto depth = frameset.get_depth_frame();
 		auto color = frameset.get_color_frame();
 
-		const int w = color.get_width();
-		const int h = color.get_height();
-
-		int nPix = w * h;
-		char* gpuImg;
-		unsigned short* gpuDepthImg;
-		char* gpuResImg;
-		cudaMalloc((void**)&gpuImg, nPix * 3 * sizeof(char));
-		cudaMalloc((void**)&gpuDepthImg, nPix * sizeof(unsigned short));
-		cudaMalloc((void**)&gpuResImg, nPix * 3 * sizeof(char));
-
 		cudaMemcpy(gpuImg, color.get_data(), nPix * 3 * sizeof(char), cudaMemcpyHostToDevice);
 		cudaMemcpy(gpuDepthImg, depth.get_data(), nPix * sizeof(unsigned short), cudaMemcpyHostToDevice);
+		cudaMemcpy(gpuBackgroundImg, background.data, nPix * 3 * sizeof(char), cudaMemcpyHostToDevice);
 
 		dim3 threadBlock(MAX_THREADS);
 		dim3 blockGrid((w * 3) / MAX_THREADS + 1, h, 1);
 
-		gammaKernel << <blockGrid, threadBlock >> > (gpuResImg, gpuImg, gpuDepthImg, w * 3, scale);
-
-		char* cpuImg;
-		cpuImg = (char*)malloc(nPix * 3 * sizeof(char));
+		gammaKernel<<<blockGrid, threadBlock >>> (gpuResImg, gpuImg, gpuDepthImg, gpuBackgroundImg, w * 3, h, scale);
 
 		cudaMemcpy(cpuImg, gpuResImg, nPix * 3 * sizeof(char), cudaMemcpyDeviceToHost);
 
-
-		cudaFree(gpuImg);
-		cudaFree(gpuDepthImg);
-		cudaFree(gpuResImg);
-
 		cv::Mat my_mat(h, w, CV_8UC3, &cpuImg[0]);
-		cv::cvtColor(my_mat, my_mat, cv::ColorConversionCodes::COLOR_BGR2RGB);
+
+		printf("%lu", sizeof(char));
+		printf("%lu", sizeof(uint8_t));
 
 		cv::namedWindow("Image window", cv::WINDOW_AUTOSIZE);
 		cv::imshow("Image window", my_mat);
 
-		glBindTexture(GL_TEXTURE_2D, to_id);
-		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+
+		virtual_output.send((const uint8_t*)cpuImg);
+
+
 		glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, w, h, GL_RGB, GL_UNSIGNED_BYTE, cpuImg);
-		//glBindFramebuffer(GL_READ_FRAMEBUFFER, readFboId);
-		//glBlitFramebuffer(0, 0, w, h, 0, 0, winWidth, winHeight, GL_COLOR_BUFFER_BIT, GL_LINEAR);
-		//glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
-		glBindTexture(GL_TEXTURE_2D, 0);
+		glBindFramebuffer(GL_READ_FRAMEBUFFER, readFboId);
+		glBlitFramebuffer(0, 0, w, h, 0, 0, winWidth, winHeight, GL_COLOR_BUFFER_BIT, GL_LINEAR);
+		glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
+
+		glfwSwapBuffers(window);
+		glfwPollEvents();
+
+		/*
 		GLenum errCode;
 		if ((errCode = glGetError()) != GL_NO_ERROR)
 		{
 			printf("%d: %s \n", errCode, gluErrorString(errCode));
 			break;
-		}
-
-		free(cpuImg);
+		}*/
 
 		if ((char)cv::waitKey(25) == 27)
 			break;
 		
 	}
+
+	cudaFree(gpuImg);
+	cudaFree(gpuDepthImg);
+	cudaFree(gpuDepthImg);
+	cudaFree(gpuResImg);
+	free(cpuImg);
 
 	return EXIT_SUCCESS;
 }
